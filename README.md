@@ -38,6 +38,7 @@ Para fins didáticos e técnicos, o sistema implementa protocolos de rede "na un
 * Máquinas Virtuais (ou instâncias locais/cloud) rodando **Linux (Debian ou Ubuntu)**.
 * Serviço **SSH** rodando nas máquinas dos Agentes (`sudo apt install openssh-server`).
 * **iptables** instalado (`sudo apt install iptables`).
+* Serviço de Logs Open-Source do Linux rodando nas máquinas dos Agentes (`sudo apt install rsyslog -y`).
 * Python 3.10 ou superior.
 * Acesso à internet para sincronização NTP (`pool.ntp.org`).
 
@@ -69,8 +70,7 @@ Os Agentes **precisam** de permissão root (`sudo`) pois manipulam o Firewall da
 Execute de dentro da pasta `src/`:
 ```bash
 cd src
-# Ative o ambiente virtual logado como sudo, ou execute usando o interpretador do venv:
-sudo ../.venv/bin/python -m agent.main --id agent-01
+sudo python3 -m agent.main --id agent-01
 ```
 *Dica: Em outras máquinas, troque o id (ex: `--id agent-02`).*
 
