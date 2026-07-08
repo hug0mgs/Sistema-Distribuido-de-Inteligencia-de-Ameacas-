@@ -76,7 +76,7 @@ from agent.heartbeat import HeartbeatSender
 from agent.firewall import BanManager
 
 # ElectionManager: thread que coordena eleição de líder (Bully Algorithm)
-from shared.election import ElectionManager
+# [DESATIVADO] from shared.election import ElectionManager
 
 # config: configurações centralizadas do Agente
 from agent import config
@@ -292,45 +292,16 @@ def main():
 
     # ================================================================
     # Callbacks de Eleição (chamados pelo ElectionManager)
+    # [DESATIVADO] Código comentado a pedido do usuário
     # ================================================================
-
+    """
     def on_promoted():
-        """
-        Callback: este Agente FOI ELEITO Broker Temporário.
-
-        Ações:
-          1. Importar e instanciar o ThreatBroker do módulo broker.main
-          2. Iniciar o ThreatBroker em uma thread separada
-          3. Atualizar broker_state para apontar para nós mesmos
-          4. Atualizar NetworkListener e HeartbeatSender
-
-        NOTA: Após a promoção, este Agente acumula funções:
-          - Continua monitorando logs (LogMonitor)
-          - Continua gerenciando firewall (BanManager)
-          - TAMBÉM roda o ThreatBroker (aceita conexões e faz broadcast)
-        """
         global _internal_broker
-
-        logger.critical(
-            ">>> PROMOÇÃO: Este Agente agora é o BROKER TEMPORÁRIO!"
-        )
-
-        # ---- Importar e instanciar ThreatBroker ----
-        # Import dinâmico: só importamos quando realmente precisamos
-        # (evita dependência circular e carrega sob demanda)
+        logger.critical(">>> PROMOÇÃO: Este Agente agora é o BROKER TEMPORÁRIO!")
         from broker.main import ThreatBroker
-
         with _internal_broker_lock:
-            # ---- Limpar broker anterior (se existir) ----
-            # Se houve um ciclo de eleição anterior (ex: falso failback),
-            # o ThreatBroker antigo pode ainda ter sockets ligados às
-            # portas 5600/5601. Precisamos fechá-los antes de criar um novo,
-            # caso contrário o bind() falha com "Address already in use".
             if _internal_broker is not None:
-                logger.warning(
-                    "ThreatBroker interno anterior ainda existe. "
-                    "Fechando sockets antes de iniciar novo..."
-                )
+                logger.warning("ThreatBroker interno anterior ainda existe. Fechando sockets antes de iniciar novo...")
                 try:
                     if _internal_broker._server_socket:
                         _internal_broker._server_socket.close()
@@ -340,66 +311,29 @@ def main():
                 except OSError:
                     pass
                 _internal_broker = None
-                # Aguardar breve para o SO liberar as portas
                 time.sleep(1)
-
             _internal_broker = ThreatBroker()
-
-        # ---- Iniciar ThreatBroker em thread separada ----
-        # O ThreatBroker.start() bloqueia no accept loop, então
-        # precisamos rodá-lo em uma thread própria
         broker_thread = threading.Thread(
             target=_internal_broker.start,
             daemon=True,
             name="InternalBrokerThread",
         )
         broker_thread.start()
-
-        logger.info(
-            "ThreatBroker interno iniciado em thread separada."
-        )
-
-        # ---- Atualizar broker_state para "eu mesmo" ----
-        # Agora os alertas devem ser enviados para localhost
-        # (o ThreatBroker interno está escutando nas mesmas portas)
+        logger.info("ThreatBroker interno iniciado em thread separada.")
         my_ip = election_manager._get_my_ip()
         with broker_state_lock:
             broker_state["host"] = my_ip
             broker_state["tcp_port"] = config.BROKER_TCP_PORT
             broker_state["udp_port"] = config.BROKER_UDP_PORT
-
-        # ---- Atualizar NetworkListener e HeartbeatSender ----
-        # Reconectar ao nosso ThreatBroker interno
         network_listener.update_broker(my_ip, config.BROKER_TCP_PORT)
         heartbeat_sender.update_broker(my_ip, config.BROKER_UDP_PORT)
-
-        logger.info(
-            "Broker state atualizado para %s (este Agente). "
-            "NetworkListener e HeartbeatSender redirecionados.",
-            my_ip,
-        )
+        logger.info("Broker state atualizado para %s (este Agente). NetworkListener e HeartbeatSender redirecionados.", my_ip)
 
     def on_demoted():
-        """
-        Callback: o Broker original VOLTOU! (failback)
-
-        Ações:
-          1. Parar o ThreatBroker interno
-          2. Restaurar broker_state para o Broker original
-          3. Atualizar NetworkListener e HeartbeatSender
-          4. Reconectar ao Broker original
-        """
         global _internal_broker
-
-        logger.critical(
-            ">>> DEMOÇÃO: Broker original voltou! "
-            "Parando ThreatBroker interno e reconectando ao original."
-        )
-
-        # ---- Parar o ThreatBroker interno ----
+        logger.critical(">>> DEMOÇÃO: Broker original voltou! Parando ThreatBroker interno e reconectando ao original.")
         with _internal_broker_lock:
             if _internal_broker is not None:
-                # Fechar sockets do Broker interno
                 try:
                     if _internal_broker._server_socket:
                         _internal_broker._server_socket.close()
@@ -407,68 +341,28 @@ def main():
                         _internal_broker._udp_socket.close()
                     _internal_broker._disconnect_all_agents()
                 except OSError:
-                    pass  # Ignorar erros ao fechar
-
+                    pass
                 _internal_broker = None
                 logger.info("ThreatBroker interno parado com sucesso.")
-
-        # ---- Restaurar broker_state para o original ----
         with broker_state_lock:
             broker_state["host"] = config.ORIGINAL_BROKER_HOST
             broker_state["tcp_port"] = config.BROKER_TCP_PORT
             broker_state["udp_port"] = config.BROKER_UDP_PORT
-
-        # ---- Atualizar NetworkListener e HeartbeatSender ----
-        # Reconectar ao Broker original
-        network_listener.update_broker(
-            config.ORIGINAL_BROKER_HOST,
-            config.BROKER_TCP_PORT,
-        )
-        heartbeat_sender.update_broker(
-            config.ORIGINAL_BROKER_HOST,
-            config.BROKER_UDP_PORT,
-        )
-
-        logger.info(
-            "Broker state restaurado para %s (original). "
-            "Reconectando ao Broker original.",
-            config.ORIGINAL_BROKER_HOST,
-        )
+        network_listener.update_broker(config.ORIGINAL_BROKER_HOST, config.BROKER_TCP_PORT)
+        heartbeat_sender.update_broker(config.ORIGINAL_BROKER_HOST, config.BROKER_UDP_PORT)
+        logger.info("Broker state restaurado para %s (original). Reconectando ao Broker original.", config.ORIGINAL_BROKER_HOST)
 
     def on_new_leader(leader_id: str, leader_ip: str):
-        """
-        Callback: OUTRO Agente foi eleito Broker Temporário.
-
-        Ações:
-          1. Atualizar broker_state com o IP do novo líder
-          2. Atualizar NetworkListener e HeartbeatSender para
-             apontar para o novo Broker Temporário
-        """
-        logger.critical(
-            ">>> NOVO LÍDER: Agente '%s' (IP: %s) é o Broker Temporário. "
-            "Redirecionando conexões.",
-            leader_id, leader_ip,
-        )
-
-        # ---- Atualizar broker_state ----
+        logger.critical(">>> NOVO LÍDER: Agente '%s' (IP: %s) é o Broker Temporário. Redirecionando conexões.", leader_id, leader_ip)
         with broker_state_lock:
             broker_state["host"] = leader_ip
             broker_state["tcp_port"] = config.BROKER_TCP_PORT
             broker_state["udp_port"] = config.BROKER_UDP_PORT
-
-        # ---- Atualizar NetworkListener e HeartbeatSender ----
         network_listener.update_broker(leader_ip, config.BROKER_TCP_PORT)
         heartbeat_sender.update_broker(leader_ip, config.BROKER_UDP_PORT)
-
-        logger.info(
-            "Broker state atualizado para %s (Broker Temporário). "
-            "Reconectando...",
-            leader_ip,
-        )
+        logger.info("Broker state atualizado para %s (Broker Temporário). Reconectando...", leader_ip)
 
     # ---- Iniciar Thread 5: Eleição de Líder (Bully Algorithm) ----
-    # O ElectionManager escuta mensagens de eleição UDP e,
-    # quando acionado, coordena a eleição e o failback.
     election_manager = ElectionManager(
         agent_id=agent_id,
         election_port=config.ELECTION_UDP_PORT,
@@ -483,17 +377,18 @@ def main():
     )
     election_manager.start()
     logger.info("Thread ElectionManager iniciada (tid: %s)", election_manager.name)
+    """
+
 
     # ---- Iniciar Thread 2: Escuta de Broadcasts TCP ----
     # O NetworkListener mantém uma conexão TCP persistente com o Broker
     # e coloca alertas recebidos (broadcast) na mesma ban_queue.
-    # Agora recebe o election_manager para acionar eleição se o Broker cair.
     network_listener = NetworkListener(
         ban_queue=ban_queue,                # fila compartilhada
         broker_host=config.BROKER_HOST,     # IP do Broker
         broker_port=config.BROKER_TCP_PORT,  # porta TCP do Broker
         agent_id=agent_id,                   # nosso ID para registro
-        election_manager=election_manager,   # para acionar eleição
+        election_manager=None,               # [DESATIVADO] election_manager,
     )
     network_listener.start()  # chama NetworkListener.run() em thread separada
     logger.info("Thread NetworkListener iniciada (tid: %s)", network_listener.name)
@@ -508,7 +403,7 @@ def main():
         network_listener.stop()     # parar escuta de rede
         heartbeat_sender.stop()     # parar heartbeat UDP
         ban_manager.stop()          # parar gerenciador de bans (desbloqueia todos)
-        election_manager.stop()     # parar eleição de líder
+        # [DESATIVADO] election_manager.stop()
 
         # Se somos Broker Temporário, parar o ThreatBroker interno
         with _internal_broker_lock:
@@ -561,7 +456,7 @@ def main():
         network_listener.stop()      # parar escuta de rede
         heartbeat_sender.stop()      # parar heartbeat UDP
         ban_manager.stop()           # parar gerenciador de bans
-        election_manager.stop()      # parar eleição de líder
+        # [DESATIVADO] election_manager.stop()
         logger.info("Agente encerrado com sucesso.")
 
 

@@ -103,7 +103,8 @@ class NetworkListener(threading.Thread):
 
         # Referência ao ElectionManager para acionar eleição
         # quando o Broker cair por tempo suficiente
-        self.election_manager = election_manager
+        # [DESATIVADO] self.election_manager = election_manager
+        self.election_manager = None
 
         # Lock para acesso thread-safe ao broker_host e broker_port.
         # Necessário porque o ElectionManager pode chamar update_broker()
@@ -127,7 +128,7 @@ class NetworkListener(threading.Thread):
         self._first_failure_time: float | None = None
 
         # Flag para evitar acionar a eleição múltiplas vezes
-        self._election_triggered = False
+        # [DESATIVADO] self._election_triggered = False
 
     def stop(self):
         """Sinaliza para a thread encerrar na próxima iteração."""
@@ -158,7 +159,7 @@ class NetworkListener(threading.Thread):
 
         # Resetar contadores de falha (novo Broker, novas chances)
         self._first_failure_time = None
-        self._election_triggered = False
+        # [DESATIVADO] self._election_triggered = False
 
         # Sinalizar reconexão forçada para interromper o delay atual
         # e forçar o loop a tentar conectar ao novo endereço imediatamente
@@ -199,7 +200,7 @@ class NetworkListener(threading.Thread):
                 # Se chegou aqui, a conexão foi bem-sucedida em algum
                 # momento. Resetar contadores de falha.
                 self._first_failure_time = None
-                self._election_triggered = False
+                # [DESATIVADO] self._election_triggered = False
 
             except ConnectionRefusedError:
                 # Broker não está rodando ou recusou a conexão
@@ -283,6 +284,8 @@ class NetworkListener(threading.Thread):
         )
 
         # Verificar se ultrapassou a tolerância
+        """
+        [DESATIVADO] Lógica de eleição
         if elapsed >= config.BROKER_FAILURE_TOLERANCE and not self._election_triggered:
             # Marcar como acionada para não disparar várias vezes
             self._election_triggered = True
@@ -301,6 +304,7 @@ class NetworkListener(threading.Thread):
                     "ElectionManager não configurado. "
                     "Não é possível iniciar eleição."
                 )
+        """
 
     def _connect_and_listen(self):
         """
