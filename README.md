@@ -1,4 +1,4 @@
-# Sistema Distribuído de Inteligência de Ameaças
+# Distributed F2BAN - Sistema Distribuído de Inteligência de Ameaças
 
 ## 🛡️ O que é o Sistema?
 
