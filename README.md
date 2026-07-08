@@ -17,11 +17,12 @@ O Broker é o nó central da rede. Sua única responsabilidade é **retransmitir
 - Monitora a saúde da rede escutando "Pulsos de Vida" (Heartbeats) enviados pelos Agentes.
 
 ### 2. O Agente (Nó Distribuído)
-O Agente roda em cada servidor que precisa ser protegido. Ele é altamente paralelo, dividido em 4 *Threads* principais:
+O Agente roda em cada servidor que precisa ser protegido. Ele é altamente paralelo, dividido em 5 *Threads* principais:
 - **LogMonitor (Detecção):** Fica lendo continuamente o arquivo `/var/log/auth.log` (técnica *tail -f*). Ao detectar 5 falhas de SSH do mesmo IP em 10 minutos, dispara um alerta de bloqueio.
-- **NetworkListener (Comunicação TCP):** Mantém uma conexão persistente com o Broker para receber alertas de ataques detectados por outros servidores da rede.
+- **NetworkListener (Comunicação TCP):** Mantém uma conexão persistente com o Broker para receber alertas de ataques detectados por outros servidores da rede. Se o Broker ficar inacessível por mais de 30 segundos, aciona a eleição de novo líder.
 - **HeartbeatSender (Monitoramento UDP):** Envia pacotes leves (UDP) a cada 10 segundos para avisar ao Broker que o servidor está online.
 - **BanManager (Firewall & NTP):** Executa os comandos reais do `iptables` para bloquear pacotes de rede do atacante. Ele também agenda o desbloqueio automático (auto-unban).
+- **ElectionManager (Eleição de Líder):** Escuta mensagens UDP de eleição na porta 5602. Quando o Broker cai, coordena uma eleição via **Bully Algorithm** (Garcia-Molina, 1982). O Agente com maior ID é eleito **Broker Temporário** e assume a função de retransmitir mensagens até que o Broker original volte (Failback).
 
 ### 📡 Protocolos de Rede e Sistemas Distribuídos Utilizados
 
@@ -29,6 +30,17 @@ Para fins didáticos e técnicos, o sistema implementa protocolos de rede "na un
 * **TCP com Length-Prefix Framing:** Usado para envio de Alertas. Resolve o problema de fragmentação do TCP enviando 4 bytes de cabeçalho indicando o tamanho exato da mensagem JSON a ser lida.
 * **UDP (Fire and Forget):** Usado para os Heartbeats. Sendo rápido e sem conexão, é ideal para enviar avisos periódicos de "estou vivo" sem sobrecarregar a rede.
 * **NTP (Network Time Protocol):** Em sistemas distribuídos, relógios locais dessincronizados causam problemas graves. O sistema consulta servidores globais (pool.ntp.org) para calcular o momento exato em que um IP deve ser desbloqueado. Isso garante que todos os servidores da rede desbloqueiem o atacante exatamente no mesmo segundo.
+* **UDP P2P (Eleição de Líder):** Quando o Broker cai, os Agentes se comunicam diretamente via UDP na porta 5602 para eleger um novo líder usando o **Bully Algorithm** (Garcia-Molina, 1982). O protocolo usa 4 tipos de mensagens: `ELECTION` (iniciar eleição), `OK` ("eu tenho prioridade maior"), `COORDINATOR` ("eu sou o novo Broker") e `DEMOTION` ("o Broker original voltou").
+
+### 🔄 Tolerância a Falhas: Eleição de Líder com Broker Temporário
+
+O sistema implementa tolerância a falhas para o centrão da rede (Broker) através de um mecanismo de **Failover com Failback automático**:
+
+1. **Detecção de Falha:** Se o Broker ficar inacessível por mais de 30 segundos, os Agentes o consideram "morto".
+2. **Eleição (Bully Algorithm):** Os Agentes se comunicam via UDP P2P. O Agente com o **maior ID** (ordem lexicográfica) vence a eleição.
+3. **Broker Temporário:** O vencedor inicia um `ThreatBroker` interno e acumula funções: continua como Agente + roda o Broker.
+4. **Recovery Probe:** O Broker Temporário tenta reconectar ao Broker original a cada 30 segundos (máx. 10 minutos).
+5. **Failback:** Se o Broker original voltar, o temporário envia `DEMOTION` e todos reconectam ao original.
 
 ---
 
@@ -73,6 +85,19 @@ cd src
 sudo python3 -m agent.main --id agent-01
 ```
 *Dica: Em outras máquinas, troque o id (ex: `--id agent-02`).*
+
+### 3. Service Discovery (Descoberta Automática de Rede)
+O sistema possui **Service Discovery**:
+* Quando um Agente inicia, ele se registra no Broker.
+* O Broker atua como um Diretório/Lista Telefônica.
+* Toda vez que um Agente entra ou sai da rede (detectado via falha de Heartbeat), o Broker envia uma mensagem `peer_update` para todos os sobreviventes.
+* Assim, todos os Agentes conhecem a topologia atual e estão prontos para iniciar a eleição caso o Broker caia, de forma 100% dinâmica.
+
+Você só precisa garantir o IP original do Broker no `src/agent/config.py`:
+```python
+# IP do Broker original (para Recovery Probe / Failback)
+ORIGINAL_BROKER_HOST = "192.168.1.100"
+```
 
 ### 🧪 Como Testar o Sistema na Prática
 

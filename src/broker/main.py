@@ -84,7 +84,7 @@ BROKER_UDP_PORT = 5601
 # Tempo máximo (em segundos) sem heartbeat antes de considerar
 # um Agente como inativo/morto. Se um Agente não envia heartbeat
 # por mais de HEARTBEAT_TIMEOUT segundos, é marcado como inativo.
-HEARTBEAT_TIMEOUT = 30
+HEARTBEAT_TIMEOUT = 60
 
 
 class ThreatBroker:
@@ -111,6 +111,10 @@ class ThreatBroker:
         # Sem isso, duas threads escrevendo simultaneamente podem
         # corromper o dicionário (race condition)
         self._agents_lock = threading.Lock()
+
+        # Dicionário auxiliar para Service Discovery (Topologia)
+        # Mantém mapeamento: {agent_id: ip_address}
+        self._agent_ips: dict[str, str] = {}
 
         # Socket do servidor TCP (será criado em start())
         self._server_socket: socket.socket | None = None
@@ -368,6 +372,8 @@ class ThreatBroker:
 
             # Armazenar o novo socket associado ao agent_id
             self._registered_agents[agent_id] = client_socket
+            # Armazenar o IP associado ao agent_id para Service Discovery
+            self._agent_ips[agent_id] = client_address[0]
 
         # Log do registro bem-sucedido
         logger.info(
@@ -385,6 +391,35 @@ class ThreatBroker:
         # NOTA: NÃO fechamos o socket aqui!
         # O socket fica armazenado em _registered_agents para
         # ser usado por _broadcast() quando houver alertas.
+
+        # SERVICE DISCOVERY:
+        # Fazer broadcast da nova topologia da rede para todos
+        # os Agentes conectados, incluindo o novo que acabou de entrar.
+        self._broadcast_peer_list()
+
+    def _broadcast_peer_list(self):
+        """
+        Gera uma lista atualizada de todos os Agentes conectados e
+        envia para toda a rede (Service Discovery).
+        """
+        with self._agents_lock:
+            # Converter dicionário para lista de tuplas [(id, ip), ...]
+            peers_list = list(self._agent_ips.items())
+        
+        # Montar mensagem de atualização de topologia
+        message = {
+            "type": "peer_update",
+            "peers": peers_list,
+        }
+
+        logger.info(
+            "Service Discovery: Fazendo broadcast da nova topologia "
+            "(%d peers na rede)", len(peers_list),
+        )
+        # Retransmitir a lista (sem excluir ninguém, todos precisam saber)
+        # Usamos is_topology_update=True para evitar loop infinito de
+        # falhas caso algum socket caia durante este envio.
+        self._broadcast(message, is_topology_update=True)
 
     def _handle_alert(
         self,
@@ -437,6 +472,7 @@ class ThreatBroker:
         self,
         message: dict,              # mensagem a ser retransmitida
         exclude_agent_id: str = "",  # Agente a excluir do broadcast
+        is_topology_update: bool = False, # Evita recursão se houver falhas
     ):
         """
         Retransmite uma mensagem para todos os Agentes registrados,
@@ -497,8 +533,9 @@ class ThreatBroker:
                         self._registered_agents[agent_id].close()
                     except OSError:
                         pass  # Socket já estava fechado, ignorar
-                    # Remover do dicionário
+                    # Remover do dicionário de sockets e IPs
                     del self._registered_agents[agent_id]
+                    self._agent_ips.pop(agent_id, None)
                     logger.info("Agente '%s' removido da lista.", agent_id)
 
         # Log do resultado do broadcast
@@ -508,6 +545,12 @@ class ThreatBroker:
             "Broadcast concluído. Agentes ativos: %d",  # resumo
             remaining,                                    # total restante
         )
+
+        # Se removemos agentes e esta chamada não era de Service Discovery,
+        # significa que a topologia mudou silenciosamente. Disparamos
+        # uma atualização para a rede.
+        if failed_agents and not is_topology_update:
+            self._broadcast_peer_list()
 
     def _disconnect_all_agents(self):
         """
@@ -656,32 +699,43 @@ class ThreatBroker:
 
         Para cada Agente no dicionário de heartbeats, calcula o tempo
         desde o último heartbeat. Se ultrapassar HEARTBEAT_TIMEOUT,
-        loga um aviso de inatividade.
-
-        Esta função NÃO remove Agentes automaticamente — apenas
-        registra avisos. O Broker continua tentando enviar broadcasts
-        para eles (a falha de envio do broadcast é que efetivamente
-        remove Agentes mortos).
+        o Agente é considerado MORTO. Seu socket é fechado, ele é
+        removido dos registros, e a nova topologia é enviada à rede.
         """
-        # Obter tempo atual
         now = time.time()
+        dead_agents = []
 
         # Seção crítica: acessar o dicionário de heartbeats
         with self._heartbeat_lock:
-            # Iterar sobre todos os Agentes com heartbeat registrado
-            for agent_id, last_heartbeat in self._heartbeat_status.items():
-                # Calcular tempo desde o último heartbeat
+            for agent_id, last_heartbeat in list(self._heartbeat_status.items()):
                 elapsed = now - last_heartbeat
-
-                # Se ultrapassou o timeout, logar aviso
                 if elapsed > HEARTBEAT_TIMEOUT:
+                    dead_agents.append(agent_id)
+                    # Remover do rastreamento de heartbeats
+                    del self._heartbeat_status[agent_id]
+
+        if dead_agents:
+            # Remover os Agentes mortos do registro TCP
+            with self._agents_lock:
+                for agent_id in dead_agents:
                     logger.warning(
-                        "ALERTA: Agente '%s' sem heartbeat há %.0fs "
-                        "(timeout: %ds). Possível falha!",  # mensagem
-                        agent_id,             # ID do Agente
-                        elapsed,              # tempo sem heartbeat
-                        HEARTBEAT_TIMEOUT,    # timeout configurado
+                        "ALERTA: Agente '%s' sem heartbeat (timeout: %ds). "
+                        "Removendo da rede e fechando conexão TCP.",
+                        agent_id, HEARTBEAT_TIMEOUT,
                     )
+                    # Fechar socket
+                    sock = self._registered_agents.get(agent_id)
+                    if sock:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                    # Limpar dicionários
+                    self._registered_agents.pop(agent_id, None)
+                    self._agent_ips.pop(agent_id, None)
+
+            # Notificar os sobreviventes sobre a mudança na topologia
+            self._broadcast_peer_list()
 
 
 # ============================================================

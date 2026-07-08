@@ -16,7 +16,7 @@ AUTH_LOG_PATH = "/var/log/auth.log"
 LOG_POLL_INTERVAL = 1.0
 
 # Número máximo de tentativas falhas de SSH antes de banir o IP
-MAX_FAILED_ATTEMPTS = 5
+MAX_FAILED_ATTEMPTS = 3
 
 # Janela de tempo (em segundos) para contar as tentativas.
 # Se um IP faz 5 tentativas em 600s (10 min), é banido.
@@ -48,3 +48,44 @@ HEARTBEAT_INTERVAL = 10
 # ============================================================
 # Servidor NTP para sincronização de tempo
 NTP_SERVER = "pool.ntp.org"
+
+# ============================================================
+# Eleição de Líder (Bully Algorithm)
+# ============================================================
+# Porta UDP para comunicação P2P entre Agentes durante a eleição.
+# Cada Agente escuta nesta porta para mensagens ELECTION, OK,
+# COORDINATOR e DEMOTION.
+ELECTION_UDP_PORT = 5602
+
+# Tempo de tolerância (em segundos) antes de considerar o Broker morto.
+# Generoso para evitar eleições desnecessárias por instabilidades
+# momentâneas de rede (micro-quedas, congestionamento, etc.).
+# São ~6 ciclos de reconexão de 5s.
+BROKER_FAILURE_TOLERANCE = 30
+
+# Timeout (em segundos) para esperar respostas "OK" durante a eleição.
+# Se nenhum Agente com ID maior responder em ELECTION_TIMEOUT segundos,
+# este Agente se declara líder (novo Broker Temporário).
+ELECTION_TIMEOUT = 5
+
+# Intervalo (em segundos) entre tentativas de reconectar ao Broker
+# original. O Broker Temporário tenta reconectar periodicamente para
+# verificar se o original voltou (Recovery Probe).
+RECOVERY_PROBE_INTERVAL = 30
+
+# Tempo máximo total (em segundos) que o Broker Temporário fica
+# tentando reconectar ao Broker original. Após esse tempo, assume
+# o papel permanentemente e para de tentar recovery.
+# 600s = 10 minutos → ~20 tentativas de recovery (600 / 30)
+RECOVERY_PROBE_MAX_DURATION = 600
+
+# IMPORTANTE: A lista de PEERS não precisa mais ser configurada
+# manualmente. O sistema utiliza Service Discovery: o Broker atua
+# como Registro Central e faz o broadcast da topologia da rede para
+# todos os Agentes conectados automaticamente.
+
+# Endereço IP original do Broker (para Recovery Probe / Failback).
+# Mantido separado do BROKER_HOST porque BROKER_HOST pode mudar
+# dinamicamente durante a eleição (apontar para o Broker Temporário).
+# Este valor NUNCA muda — é sempre o IP da máquina do Broker original.
+ORIGINAL_BROKER_HOST = "127.0.0.1"

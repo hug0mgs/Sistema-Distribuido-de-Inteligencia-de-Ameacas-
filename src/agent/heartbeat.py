@@ -96,6 +96,11 @@ class HeartbeatSender(threading.Thread):
         self.broker_port = broker_port  # porta UDP do Broker
         self.agent_id = agent_id        # nosso identificador
 
+        # Lock para acesso thread-safe ao broker_host e broker_port.
+        # Necessário porque o ElectionManager pode chamar update_broker()
+        # de outra thread durante uma eleição ou failback.
+        self._broker_lock = threading.Lock()
+
         # Evento de parada para encerramento gracioso
         self._stop_event = threading.Event()
 
@@ -104,6 +109,30 @@ class HeartbeatSender(threading.Thread):
         logger.info("Sinalizando parada da thread HeartbeatSender...")
         # Marcar o evento de parada
         self._stop_event.set()
+
+    def update_broker(self, new_host: str, new_port: int):
+        """
+        Atualiza o destino dos heartbeats para um novo Broker.
+
+        Chamado pelo main.py quando:
+          - Um novo Broker Temporário é eleito (eleição)
+          - O Broker original volta (failback / demotion)
+
+        Thread-safe: usa lock para proteger a atualização.
+
+        Args:
+            new_host: novo IP do Broker.
+            new_port: nova porta UDP do Broker.
+        """
+        with self._broker_lock:
+            old_host = self.broker_host
+            self.broker_host = new_host
+            self.broker_port = new_port
+
+        logger.info(
+            "HeartbeatSender: destino atualizado de %s para %s:%d",
+            old_host, new_host, new_port,
+        )
 
     def run(self):
         """
@@ -155,6 +184,13 @@ class HeartbeatSender(threading.Thread):
                 payload = json.dumps(heartbeat_data).encode("utf-8")
 
                 try:
+                    # ---- Ler destino atual (thread-safe) ----
+                    # O destino pode mudar dinamicamente se houver
+                    # uma eleição ou failback. Lemos sob lock.
+                    with self._broker_lock:
+                        current_host = self.broker_host
+                        current_port = self.broker_port
+
                     # ---- Enviar pacote UDP via sendto() ----
                     # sendto() é específico de UDP:
                     #   - Primeiro argumento: bytes a enviar
@@ -162,15 +198,15 @@ class HeartbeatSender(threading.Thread):
                     # Não precisa de connect() — cada sendto() é independente
                     udp_socket.sendto(
                         payload,                                   # dados a enviar
-                        (self.broker_host, self.broker_port),      # destino (IP, porta)
+                        (current_host, current_port),              # destino (IP, porta)
                     )
 
                     # Log do heartbeat enviado (nível DEBUG para não poluir)
                     logger.debug(
                         "Heartbeat #%d enviado para %s:%d",  # mensagem
                         heartbeat_count,                      # sequência
-                        self.broker_host,                     # IP destino
-                        self.broker_port,                     # porta destino
+                        current_host,                         # IP destino
+                        current_port,                         # porta destino
                     )
 
                 except OSError as e:

@@ -9,6 +9,11 @@ Este módulo contém:
        Agentes detectaram). Quando recebe um alerta, coloca na
        ban_queue para o loop principal processar.
 
+       INTEGRAÇÃO COM ELEIÇÃO:
+       Se a conexão com o Broker falhar por mais de
+       BROKER_FAILURE_TOLERANCE segundos, aciona o ElectionManager
+       para iniciar uma eleição de novo líder via Bully Algorithm.
+
   2. send_alert_to_broker (Função):
        Chamada pelo loop principal quando o LogMonitor detecta um
        ataque local. Abre uma conexão TCP temporária com o Broker,
@@ -67,12 +72,14 @@ class NetworkListener(threading.Thread):
       3. Entra em loop recebendo mensagens via protocolo length-prefix
       4. Para cada mensagem recebida, coloca na ban_queue
       5. Se a conexão cair, tenta reconectar após N segundos
+      6. Se falhar por mais de BROKER_FAILURE_TOLERANCE, aciona eleição
 
     Atributos:
         ban_queue: fila onde coloca alertas recebidos do Broker
-        broker_host: endereço IP do Broker
+        broker_host: endereço IP do Broker (pode mudar após eleição)
         broker_port: porta TCP do Broker
         agent_id: identificador único deste Agente na rede
+        election_manager: referência ao ElectionManager para acionar eleição
         _stop_event: sinaliza para a thread parar
     """
 
@@ -82,6 +89,7 @@ class NetworkListener(threading.Thread):
         broker_host: str,       # IP do Broker (ex: "192.168.1.10")
         broker_port: int,       # porta TCP do Broker (ex: 5600)
         agent_id: str,          # identificador deste Agente (ex: "agent-01")
+        election_manager=None,  # referência ao ElectionManager (opcional)
     ):
         # daemon=True: thread morre quando o programa principal encerra
         # name: nome legível para identificar a thread em logs/debug
@@ -93,17 +101,64 @@ class NetworkListener(threading.Thread):
         self.broker_port = broker_port  # porta do Broker
         self.agent_id = agent_id        # ID deste Agente
 
+        # Referência ao ElectionManager para acionar eleição
+        # quando o Broker cair por tempo suficiente
+        self.election_manager = election_manager
+
+        # Lock para acesso thread-safe ao broker_host e broker_port.
+        # Necessário porque o ElectionManager pode chamar update_broker()
+        # de outra thread durante uma eleição ou failback.
+        self._broker_lock = threading.Lock()
+
         # Evento de parada para encerramento gracioso
         self._stop_event = threading.Event()
 
         # Intervalo entre tentativas de reconexão (em segundos)
         self._reconnect_delay = 5
 
+        # Timestamp da primeira falha consecutiva de conexão.
+        # Usado para calcular se já passamos de BROKER_FAILURE_TOLERANCE.
+        # None = sem falha ativa (conexão está OK)
+        self._first_failure_time: float | None = None
+
+        # Flag para evitar acionar a eleição múltiplas vezes
+        self._election_triggered = False
+
     def stop(self):
         """Sinaliza para a thread encerrar na próxima iteração."""
         # Marcar o evento de parada como "setado"
         logger.info("Sinalizando parada da thread NetworkListener...")
         self._stop_event.set()
+
+    def update_broker(self, new_host: str, new_port: int):
+        """
+        Atualiza o endereço do Broker para uma nova localização.
+
+        Chamado pelo main.py quando:
+          - Um novo Broker Temporário é eleito (eleição)
+          - O Broker original volta (failback / demotion)
+
+        Thread-safe: usa lock para proteger a atualização.
+        Também reseta os contadores de falha para permitir
+        reconexão imediata ao novo Broker.
+
+        Args:
+            new_host: novo IP do Broker.
+            new_port: nova porta TCP do Broker.
+        """
+        with self._broker_lock:
+            old_host = self.broker_host
+            self.broker_host = new_host
+            self.broker_port = new_port
+
+        # Resetar contadores de falha (novo Broker, novas chances)
+        self._first_failure_time = None
+        self._election_triggered = False
+
+        logger.info(
+            "NetworkListener: destino atualizado de %s para %s:%d",
+            old_host, new_host, new_port,
+        )
 
     def run(self):
         """
@@ -112,6 +167,11 @@ class NetworkListener(threading.Thread):
         Implementa um loop de conexão com reconexão automática:
         se a conexão com o Broker cair, espera alguns segundos e
         tenta conectar de novo (tolerância a falhas).
+
+        INTEGRAÇÃO COM ELEIÇÃO:
+        Se a conexão falhar continuamente por mais de
+        BROKER_FAILURE_TOLERANCE segundos, aciona o ElectionManager
+        para iniciar uma eleição de novo líder.
         """
         logger.info(
             "Thread NetworkListener iniciada. "  # mensagem informativa
@@ -127,6 +187,11 @@ class NetworkListener(threading.Thread):
                 # Tentar conectar e escutar mensagens do Broker
                 self._connect_and_listen()
 
+                # Se chegou aqui, a conexão foi bem-sucedida em algum
+                # momento. Resetar contadores de falha.
+                self._first_failure_time = None
+                self._election_triggered = False
+
             except ConnectionRefusedError:
                 # Broker não está rodando ou recusou a conexão
                 logger.warning(
@@ -136,6 +201,8 @@ class NetworkListener(threading.Thread):
                     self.broker_port,                          # porta
                     self._reconnect_delay,                    # delay
                 )
+                # Registrar falha e verificar se devemos acionar eleição
+                self._check_failure_tolerance()
 
             except ConnectionResetError:
                 # Broker fechou a conexão abruptamente (crash, reinício)
@@ -144,6 +211,8 @@ class NetworkListener(threading.Thread):
                     "Tentando reconectar em %ds...",   # aviso
                     self._reconnect_delay,             # delay
                 )
+                # Registrar falha e verificar se devemos acionar eleição
+                self._check_failure_tolerance()
 
             except OSError as e:
                 # Outro erro de rede (timeout, rede inacessível, etc.)
@@ -153,6 +222,8 @@ class NetworkListener(threading.Thread):
                     e,                                 # detalhes do erro
                     self._reconnect_delay,             # delay
                 )
+                # Registrar falha e verificar se devemos acionar eleição
+                self._check_failure_tolerance()
 
             # ---- Esperar antes de reconectar ----
             # Usamos _stop_event.wait() em vez de time.sleep() porque:
@@ -165,6 +236,57 @@ class NetworkListener(threading.Thread):
         # Thread encerrada
         logger.info("Thread NetworkListener encerrada.")
 
+    def _check_failure_tolerance(self):
+        """
+        Verifica se o tempo de falha consecutiva ultrapassou o
+        BROKER_FAILURE_TOLERANCE. Se sim, aciona a eleição.
+
+        Lógica:
+          - Na primeira falha, registra o timestamp em _first_failure_time
+          - Nas falhas seguintes, calcula o tempo total de falha
+          - Se ultrapassou BROKER_FAILURE_TOLERANCE, aciona eleição
+          - A eleição só é acionada UMA VEZ (_election_triggered)
+        """
+        # Registrar a primeira falha
+        if self._first_failure_time is None:
+            self._first_failure_time = time.time()
+            logger.info(
+                "Primeira falha de conexão com o Broker registrada. "
+                "Tolerância: %ds",
+                config.BROKER_FAILURE_TOLERANCE,
+            )
+            return
+
+        # Calcular tempo total de falha
+        elapsed = time.time() - self._first_failure_time
+
+        logger.info(
+            "Falha de conexão contínua há %.0fs "
+            "(tolerância: %ds)",
+            elapsed,
+            config.BROKER_FAILURE_TOLERANCE,
+        )
+
+        # Verificar se ultrapassou a tolerância
+        if elapsed >= config.BROKER_FAILURE_TOLERANCE and not self._election_triggered:
+            # Marcar como acionada para não disparar várias vezes
+            self._election_triggered = True
+
+            logger.critical(
+                ">>> BROKER CONSIDERADO MORTO após %.0fs sem conexão! "
+                "Acionando eleição de novo líder...",
+                elapsed,
+            )
+
+            # Acionar eleição via ElectionManager
+            if self.election_manager:
+                self.election_manager.trigger_election()
+            else:
+                logger.warning(
+                    "ElectionManager não configurado. "
+                    "Não é possível iniciar eleição."
+                )
+
     def _connect_and_listen(self):
         """
         Conecta ao Broker e entra em loop de recebimento de mensagens.
@@ -175,6 +297,12 @@ class NetworkListener(threading.Thread):
           3. Enviar mensagem de registro
           4. Loop de recebimento de mensagens
         """
+        # ---- Ler endereço do Broker (thread-safe) ----
+        # O endereço pode mudar dinamicamente após eleição/failback
+        with self._broker_lock:
+            current_host = self.broker_host
+            current_port = self.broker_port
+
         # ---- Passo 1: Criar socket TCP/IPv4 ----
         # AF_INET  = família de endereços IPv4 (ex: 192.168.1.1)
         # SOCK_STREAM = protocolo orientado a stream/conexão = TCP
@@ -189,11 +317,15 @@ class NetworkListener(threading.Thread):
             # Após isso, a conexão TCP está estabelecida.
             logger.info(
                 "Conectando ao Broker em %s:%d...",  # log da tentativa
-                self.broker_host,                    # IP destino
-                self.broker_port,                    # porta destino
+                current_host,                        # IP destino
+                current_port,                        # porta destino
             )
-            sock.connect((self.broker_host, self.broker_port))
+            sock.connect((current_host, current_port))
             logger.info("Conectado ao Broker com sucesso!")
+
+            # Conexão bem-sucedida — resetar contadores de falha
+            self._first_failure_time = None
+            self._election_triggered = False
 
             # ---- Passo 3: Enviar mensagem de REGISTRO ----
             # Informa ao Broker que este é um Agente que deseja
@@ -227,7 +359,18 @@ class NetworkListener(threading.Thread):
                     # que tentará reconectar
                     break
 
-                # Mensagem recebida com sucesso — processar
+                # ---- Roteamento da Mensagem ----
+                msg_type = message.get("type", "unknown")
+
+                if msg_type == "peer_update":
+                    # SERVICE DISCOVERY: Atualização da topologia da rede
+                    logger.info("Recebida atualização de topologia (Service Discovery).")
+                    if self.election_manager:
+                        peers_list = message.get("peers", [])
+                        self.election_manager.update_peers(peers_list)
+                    continue  # Volta ao loop, não coloca na fila de bans
+
+                # Mensagem de alerta de ban recebida com sucesso — processar
                 logger.info(
                     "Alerta recebido do Broker: %s",  # log do alerta
                     message,                          # conteúdo da mensagem
