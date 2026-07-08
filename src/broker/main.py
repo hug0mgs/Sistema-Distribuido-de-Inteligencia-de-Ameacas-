@@ -202,7 +202,17 @@ class ThreatBroker:
             sys.exit(0)
 
         # Registrar o handler para o sinal SIGINT (Ctrl+C)
-        signal.signal(signal.SIGINT, signal_handler)
+        # NOTA: signal.signal() só pode ser chamado na thread principal.
+        # Quando o ThreatBroker é instanciado como Broker Temporário
+        # dentro de uma thread daemon (após eleição), esta chamada
+        # falharia com ValueError. Por isso, verificamos antes.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, signal_handler)
+        else:
+            logger.info(
+                "ThreatBroker iniciado em thread secundária — "
+                "signal handler de Ctrl+C não registrado (gerenciado pelo Agente)."
+            )
 
         # ---- Loop principal: aceitar novas conexões TCP ----
         # accept() bloqueia até um cliente conectar (ou timeout)
@@ -644,7 +654,12 @@ class ThreatBroker:
 
         # Configurar timeout para permitir verificação periódica
         # de Agentes inativos e shutdown gracioso
-        self._udp_socket.settimeout(5.0)
+        try:
+            self._udp_socket.settimeout(5.0)
+        except OSError:
+            # Socket pode ter sido fechado externamente (ex: demoção)
+            logger.info("Socket UDP já fechado antes de iniciar HeartbeatListener.")
+            return
 
         while True:
             try:

@@ -32,7 +32,13 @@ DEFAULT_BAN_DURATION = 3600
 # Rede — Conexão com o Broker
 # ============================================================
 # Endereço IP do Broker (Servidor de Coordenação)
-BROKER_HOST = "127.0.0.1"
+BROKER_HOST = "192.168.15.7"
+
+# Endereço IP original do Broker (para Recovery Probe / Failback).
+# Mantido separado do BROKER_HOST porque BROKER_HOST pode mudar
+# dinamicamente durante a eleição (apontar para o Broker Temporário).
+# Este valor NUNCA muda — é sempre o IP da máquina do Broker original.
+ORIGINAL_BROKER_HOST = "192.168.15.7"
 
 # Porta TCP do Broker para envio/recebimento de alertas
 BROKER_TCP_PORT = 5600
@@ -83,9 +89,3 @@ RECOVERY_PROBE_MAX_DURATION = 600
 # manualmente. O sistema utiliza Service Discovery: o Broker atua
 # como Registro Central e faz o broadcast da topologia da rede para
 # todos os Agentes conectados automaticamente.
-
-# Endereço IP original do Broker (para Recovery Probe / Failback).
-# Mantido separado do BROKER_HOST porque BROKER_HOST pode mudar
-# dinamicamente durante a eleição (apontar para o Broker Temporário).
-# Este valor NUNCA muda — é sempre o IP da máquina do Broker original.
-ORIGINAL_BROKER_HOST = "127.0.0.1"
