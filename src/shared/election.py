@@ -231,6 +231,15 @@ class ElectionManager(threading.Thread):
             socket.SO_REUSEADDR,
             1,
         )
+        # Habilitar envio de broadcast UDP.
+        # Necessário para que sendto() com "255.255.255.255" funcione.
+        # SO_BROADCAST permite enviar pacotes para o endereço de broadcast
+        # da rede, alcançando TODOS os hosts na subrede.
+        self._udp_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_BROADCAST,
+            1,
+        )
         # Vincular a porta de eleição em todas as interfaces
         self._udp_socket.bind(("0.0.0.0", self._election_port))
         # Timeout para permitir verificação periódica do stop_event
@@ -245,6 +254,12 @@ class ElectionManager(threading.Thread):
                 # Decodificar JSON
                 message = json.loads(data.decode("utf-8"))
                 msg_type = message.get("type", "unknown")
+
+                # Ignorar mensagens enviadas por nós mesmos (eco do broadcast).
+                # Quando usamos UDP broadcast, o socket também recebe
+                # os pacotes que NÓS enviamos. Filtramos pelo sender_id.
+                if message.get("sender_id") == self.agent_id:
+                    continue
 
                 # Rotear por tipo de mensagem
                 if msg_type == "election":
@@ -298,9 +313,20 @@ class ElectionManager(threading.Thread):
         # Resetar flag de resposta OK
         self._received_ok.clear()
 
-        # Filtrar peers com ID MAIOR que o nosso (ordem lexicográfica)
-        # No Bully Algorithm, só enviamos ELECTION para quem tem
-        # prioridade MAIOR. Se nenhum deles responder, somos o maior.
+        # ---- Enviar ELECTION via broadcast UDP ----
+        # Usamos broadcast para garantir que TODOS os Agentes na rede
+        # recebam a mensagem, mesmo que a lista de peers esteja vazia
+        # (o Service Discovery depende do Broker, que justamente caiu).
+        # Agentes com ID maior responderão OK; os demais ignoram.
+        logger.info(
+            "Enviando ELECTION via broadcast UDP para a rede..."
+        )
+        self._broadcast_election_message(
+            msg_type="election",
+        )
+
+        # Também enviar unicast para peers conhecidos com ID maior
+        # (redundância: garante entrega se o broadcast não alcançar)
         with self._peers_lock:
             higher_peers = [
                 (pid, pip) for pid, pip in self.peers
@@ -308,9 +334,9 @@ class ElectionManager(threading.Thread):
             ]
 
         if higher_peers:
-            # Enviar ELECTION para cada peer com ID maior
             logger.info(
-                "Enviando ELECTION para %d peers com ID maior: %s",
+                "Também enviando ELECTION unicast para %d peers "
+                "conhecidos com ID maior: %s",
                 len(higher_peers),
                 [pid for pid, _ in higher_peers],
             )
@@ -321,31 +347,28 @@ class ElectionManager(threading.Thread):
                     extra={"sender_id": self.agent_id},
                 )
 
-            # Esperar por respostas OK
-            logger.info(
-                "Aguardando respostas OK por %ds...",
-                self._election_timeout,
-            )
-            got_ok = self._received_ok.wait(timeout=self._election_timeout)
+        # ---- Esperar por respostas OK ----
+        # Aguardamos ELECTION_TIMEOUT independente de termos peers
+        # conhecidos, pois o broadcast pode alcançar Agentes que
+        # não estavam na lista de peers.
+        logger.info(
+            "Aguardando respostas OK por %ds...",
+            self._election_timeout,
+        )
+        got_ok = self._received_ok.wait(timeout=self._election_timeout)
 
-            if got_ok:
-                # Alguém com ID maior respondeu — desistir
-                logger.info(
-                    "Recebido OK de um peer com ID maior. "
-                    "Desistindo da eleição e aguardando COORDINATOR."
-                )
-                # Voltar ao estado IDLE — vamos esperar o COORDINATOR
-                # do peer que vai vencer
-                with self._state_lock:
-                    if self._state == self.STATE_ELECTING:
-                        self._state = self.STATE_IDLE
-                return
-        else:
+        if got_ok:
+            # Alguém com ID maior respondeu — desistir
             logger.info(
-                "Nenhum peer com ID maior que '%s'. "
-                "Eu sou o de MAIOR prioridade!",
-                self.agent_id,
+                "Recebido OK de um peer com ID maior. "
+                "Desistindo da eleição e aguardando COORDINATOR."
             )
+            # Voltar ao estado IDLE — vamos esperar o COORDINATOR
+            # do peer que vai vencer
+            with self._state_lock:
+                if self._state == self.STATE_ELECTING:
+                    self._state = self.STATE_IDLE
+            return
 
         # ---- Nenhum OK recebido ou ninguém maior existe ----
         # EU SOU O NOVO LÍDER!
@@ -358,19 +381,19 @@ class ElectionManager(threading.Thread):
         with self._state_lock:
             self._state = self.STATE_TEMP_BROKER
 
-        # Enviar COORDINATOR para TODOS os peers
-        # Informar que este Agente é o novo Broker
+        # Enviar COORDINATOR via broadcast UDP para TODA a rede.
+        # Broadcast garante que todos os Agentes recebam, mesmo que
+        # a lista de peers esteja vazia ou desatualizada (o Broker
+        # que fazia Service Discovery estava fora do ar).
         my_ip = self._get_my_ip()
-        with self._peers_lock:
-            for peer_id, peer_ip in self.peers:
-                self._send_election_message(
-                    msg_type="coordinator",
-                    target_ip=peer_ip,
-                    extra={
-                        "leader_id": self.agent_id,
-                        "leader_ip": my_ip,
-                    },
-                )
+        logger.info("Enviando COORDINATOR via broadcast UDP...")
+        self._broadcast_election_message(
+            msg_type="coordinator",
+            extra={
+                "leader_id": self.agent_id,
+                "leader_ip": my_ip,
+            },
+        )
 
         # Chamar callback de promoção (main.py vai iniciar ThreatBroker)
         logger.info("Chamando callback de promoção (on_promoted)...")
@@ -607,20 +630,17 @@ class ElectionManager(threading.Thread):
 
                 # Fechar a conexão de teste (saiu do 'with')
 
-                # Enviar DEMOTION para todos os peers
-                with self._peers_lock:
-                    logger.info(
-                        "Enviando DEMOTION para %d peers...",
-                        len(self.peers),
-                    )
-                    for peer_id, peer_ip in self.peers:
-                        self._send_election_message(
-                            msg_type="demotion",
-                            target_ip=peer_ip,
-                            extra={
-                                "original_broker_host": self._original_broker_host,
-                            },
-                        )
+                # Enviar DEMOTION via broadcast UDP para TODA a rede.
+                # Assim como o COORDINATOR, o DEMOTION precisa alcançar
+                # todos os Agentes, mesmo que a lista de peers esteja
+                # desatualizada (o Broker original estava fora do ar).
+                logger.info("Enviando DEMOTION via broadcast UDP...")
+                self._broadcast_election_message(
+                    msg_type="demotion",
+                    extra={
+                        "original_broker_host": self._original_broker_host,
+                    },
+                )
 
                 # Atualizar estado para IDLE
                 with self._state_lock:
@@ -666,8 +686,9 @@ class ElectionManager(threading.Thread):
             target_ip: endereço IP do peer destinatário
             extra: campos adicionais para incluir no JSON
         """
-        # Montar mensagem
-        message = {"type": msg_type}
+        # Montar mensagem (sender_id é incluído para filtragem de eco
+        # quando a rede usa broadcast UDP)
+        message = {"type": msg_type, "sender_id": self.agent_id}
         if extra:
             message.update(extra)
 
@@ -689,6 +710,60 @@ class ElectionManager(threading.Thread):
             logger.warning(
                 "Falha ao enviar mensagem '%s' para %s: %s",
                 msg_type, target_ip, e,
+            )
+
+    def _broadcast_election_message(
+        self,
+        msg_type: str,       # tipo da mensagem (election, coordinator, demotion)
+        extra: dict = None,  # campos adicionais do JSON
+    ):
+        """
+        Envia uma mensagem de eleição via UDP broadcast para toda a rede.
+
+        Diferente de _send_election_message (unicast para um peer específico),
+        este método envia para o endereço de broadcast 255.255.255.255,
+        alcançando TODOS os hosts na subrede local.
+
+        Usado para mensagens que precisam alcançar TODOS os Agentes,
+        mesmo quando a lista de peers está vazia ou desatualizada:
+          - ELECTION: descobrir Agentes com ID maior na rede
+          - COORDINATOR: informar quem é o novo Broker Temporário
+          - DEMOTION: informar que o Broker original voltou
+
+        CONCEITO DE REDE — Broadcast UDP:
+          O endereço 255.255.255.255 é o "limited broadcast address".
+          Pacotes enviados para este endereço são entregues a TODOS
+          os hosts na mesma subrede local (não atravessam roteadores).
+          Requer SO_BROADCAST habilitado no socket.
+
+        Args:
+            msg_type: tipo da mensagem (election, coordinator, demotion)
+            extra: campos adicionais para incluir no JSON
+        """
+        # Montar mensagem com sender_id para filtragem de eco
+        message = {"type": msg_type, "sender_id": self.agent_id}
+        if extra:
+            message.update(extra)
+
+        # Serializar e codificar
+        payload = json.dumps(message).encode("utf-8")
+
+        try:
+            if self._udp_socket:
+                # Enviar via UDP broadcast (255.255.255.255)
+                # O pacote será entregue a todos os hosts na subrede
+                self._udp_socket.sendto(
+                    payload,
+                    ("255.255.255.255", self._election_port),
+                )
+                logger.info(
+                    "Mensagem '%s' enviada via BROADCAST UDP (porta %d)",
+                    msg_type, self._election_port,
+                )
+        except OSError as e:
+            logger.warning(
+                "Falha ao enviar broadcast '%s': %s",
+                msg_type, e,
             )
 
     def _get_my_ip(self) -> str:

@@ -113,6 +113,11 @@ class NetworkListener(threading.Thread):
         # Evento de parada para encerramento gracioso
         self._stop_event = threading.Event()
 
+        # Evento de reconexão forçada: sinalizado por update_broker()
+        # para interromper imediatamente o delay de reconexão e
+        # forçar uma nova tentativa com o endereço atualizado.
+        self._reconnect_event = threading.Event()
+
         # Intervalo entre tentativas de reconexão (em segundos)
         self._reconnect_delay = 5
 
@@ -154,6 +159,10 @@ class NetworkListener(threading.Thread):
         # Resetar contadores de falha (novo Broker, novas chances)
         self._first_failure_time = None
         self._election_triggered = False
+
+        # Sinalizar reconexão forçada para interromper o delay atual
+        # e forçar o loop a tentar conectar ao novo endereço imediatamente
+        self._reconnect_event.set()
 
         logger.info(
             "NetworkListener: destino atualizado de %s para %s:%d",
@@ -230,8 +239,14 @@ class NetworkListener(threading.Thread):
             # - time.sleep(5) bloqueia 5 segundos INCONDICIONALMENTE
             # - _stop_event.wait(5) retorna IMEDIATAMENTE se stop() for
             #   chamado, permitindo encerramento rápido
-            if not self._stop_event.is_set():
+            # Também verificamos _reconnect_event: se update_broker() for
+            # chamado (ex: após eleição), acordamos imediatamente para
+            # conectar ao novo Broker sem esperar o delay completo.
+            if not self._stop_event.is_set() and not self._reconnect_event.is_set():
                 self._stop_event.wait(self._reconnect_delay)
+
+            # Limpar o evento de reconexão (já foi consumido)
+            self._reconnect_event.clear()
 
         # Thread encerrada
         logger.info("Thread NetworkListener encerrada.")
