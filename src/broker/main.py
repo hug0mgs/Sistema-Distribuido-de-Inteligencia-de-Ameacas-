@@ -159,7 +159,31 @@ class ThreatBroker:
         # ---- Bind: associar o socket a endereço + porta ----
         # "0.0.0.0" = escutar em TODAS as interfaces de rede
         # (necessário para receber conexões de outras VMs na rede)
-        self._server_socket.bind((BROKER_BIND_HOST, BROKER_TCP_PORT))
+        # Retry com delay: quando o ThreatBroker é iniciado como Broker
+        # Temporário após uma eleição, a instância anterior pode não ter
+        # liberado as portas completamente. Tentamos até 5 vezes.
+        max_bind_attempts = 5
+        for attempt in range(1, max_bind_attempts + 1):
+            try:
+                self._server_socket.bind((BROKER_BIND_HOST, BROKER_TCP_PORT))
+                break  # bind bem-sucedido
+            except OSError as e:
+                if attempt < max_bind_attempts:
+                    logger.warning(
+                        "Bind falhou na tentativa %d/%d: %s. "
+                        "Aguardando 2s para a porta ser liberada...",
+                        attempt, max_bind_attempts, e,
+                    )
+                    time.sleep(2)
+                else:
+                    # Todas as tentativas falharam — propagar o erro
+                    logger.error(
+                        "Bind falhou após %d tentativas. "
+                        "A porta %d não foi liberada.",
+                        max_bind_attempts, BROKER_TCP_PORT,
+                    )
+                    raise
+
         logger.info(
             "Socket vinculado a %s:%d",  # mensagem
             BROKER_BIND_HOST,             # endereço

@@ -321,6 +321,28 @@ def main():
         from broker.main import ThreatBroker
 
         with _internal_broker_lock:
+            # ---- Limpar broker anterior (se existir) ----
+            # Se houve um ciclo de eleição anterior (ex: falso failback),
+            # o ThreatBroker antigo pode ainda ter sockets ligados às
+            # portas 5600/5601. Precisamos fechá-los antes de criar um novo,
+            # caso contrário o bind() falha com "Address already in use".
+            if _internal_broker is not None:
+                logger.warning(
+                    "ThreatBroker interno anterior ainda existe. "
+                    "Fechando sockets antes de iniciar novo..."
+                )
+                try:
+                    if _internal_broker._server_socket:
+                        _internal_broker._server_socket.close()
+                    if _internal_broker._udp_socket:
+                        _internal_broker._udp_socket.close()
+                    _internal_broker._disconnect_all_agents()
+                except OSError:
+                    pass
+                _internal_broker = None
+                # Aguardar breve para o SO liberar as portas
+                time.sleep(1)
+
             _internal_broker = ThreatBroker()
 
         # ---- Iniciar ThreatBroker em thread separada ----
