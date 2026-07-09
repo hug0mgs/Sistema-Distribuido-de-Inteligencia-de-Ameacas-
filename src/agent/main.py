@@ -292,7 +292,7 @@ def main():
 
     # ================================================================
     # Callbacks de Eleição (chamados pelo ElectionManager)
-    # [DESATIVADO] Código comentado a pedido do usuário
+    # [DESATIVADO] Projetos futuros
     # ================================================================
     """
     def on_promoted():
